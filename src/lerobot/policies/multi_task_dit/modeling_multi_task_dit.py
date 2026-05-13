@@ -93,6 +93,7 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
                 action_dim=action_dim,
                 horizon=horizon,
                 do_mask_loss_for_padding=config.do_mask_loss_for_padding,
+                action_loss_weights=config.action_loss_weights,
             )
         elif config.is_flow_matching:
             self.objective = FlowMatchingObjective(
@@ -100,6 +101,7 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
                 action_dim=action_dim,
                 horizon=horizon,
                 do_mask_loss_for_padding=config.do_mask_loss_for_padding,
+                action_loss_weights=config.action_loss_weights,
             )
         else:
             raise ValueError(f"Unsupported objective: {config.objective}")
@@ -635,12 +637,29 @@ class DiffusionTransformer(nn.Module):
 class DiffusionObjective(nn.Module):
     """Standard diffusion (DDPM/DDIM) objective implementation."""
 
-    def __init__(self, config, action_dim: int, horizon: int, do_mask_loss_for_padding: bool = False):
+    def __init__(
+        self,
+        config,
+        action_dim: int,
+        horizon: int,
+        do_mask_loss_for_padding: bool = False,
+        action_loss_weights: tuple[float, ...] | None = None,
+    ):
         super().__init__()
         self.config = config
         self.action_dim = action_dim
         self.horizon = horizon
         self.do_mask_loss_for_padding = do_mask_loss_for_padding
+
+        if action_loss_weights is not None:
+            if len(action_loss_weights) != action_dim:
+                raise ValueError(
+                    f"action_loss_weights has length {len(action_loss_weights)} but action_dim is {action_dim}"
+                )
+            w = torch.tensor(list(action_loss_weights), dtype=torch.float32).view(1, 1, -1)
+        else:
+            w = torch.ones(action_dim, dtype=torch.float32).view(1, 1, -1)
+        self.register_buffer("action_loss_weights", w, persistent=False)
 
         scheduler_kwargs = {
             "num_train_timesteps": config.num_train_timesteps,
@@ -686,11 +705,13 @@ class DiffusionObjective(nn.Module):
 
         predicted = model(noisy_actions, timesteps, conditioning_vec=conditioning_vec)
         loss = F.mse_loss(predicted, target, reduction="none")
+        loss = loss * self.action_loss_weights.to(device=loss.device, dtype=loss.dtype)
 
         if self.do_mask_loss_for_padding and "action_is_pad" in batch:
             mask = ~batch["action_is_pad"].unsqueeze(-1)
-            num_valid = mask.sum() * loss.shape[-1]
-            return (loss * mask).sum() / num_valid.clamp_min(1)
+            weighted = loss * mask
+            denom = (mask * self.action_loss_weights.to(device=loss.device, dtype=loss.dtype)).sum()
+            return weighted.sum() / denom.clamp_min(1e-8)
 
         return loss.mean()
 
@@ -719,12 +740,29 @@ class DiffusionObjective(nn.Module):
 class FlowMatchingObjective(nn.Module):
     """Flow matching objective: trains a model to predict velocity fields."""
 
-    def __init__(self, config, action_dim: int, horizon: int, do_mask_loss_for_padding: bool = False):
+    def __init__(
+        self,
+        config,
+        action_dim: int,
+        horizon: int,
+        do_mask_loss_for_padding: bool = False,
+        action_loss_weights: tuple[float, ...] | None = None,
+    ):
         super().__init__()
         self.config = config
         self.action_dim = action_dim
         self.horizon = horizon
         self.do_mask_loss_for_padding = do_mask_loss_for_padding
+
+        if action_loss_weights is not None:
+            if len(action_loss_weights) != action_dim:
+                raise ValueError(
+                    f"action_loss_weights has length {len(action_loss_weights)} but action_dim is {action_dim}"
+                )
+            w = torch.tensor(list(action_loss_weights), dtype=torch.float32).view(1, 1, -1)
+        else:
+            w = torch.ones(action_dim, dtype=torch.float32).view(1, 1, -1)
+        self.register_buffer("action_loss_weights", w, persistent=False)
 
     def _sample_timesteps(self, batch_size: int, device: torch.device) -> Tensor:
         if self.config.timestep_sampling_strategy == "uniform":
@@ -751,11 +789,13 @@ class FlowMatchingObjective(nn.Module):
         target_velocity = data - (1 - self.config.sigma_min) * noise
         predicted_velocity = model(x_t, t, conditioning_vec=conditioning_vec)
         loss = F.mse_loss(predicted_velocity, target_velocity, reduction="none")
+        loss = loss * self.action_loss_weights.to(device=loss.device, dtype=loss.dtype)
 
         if self.do_mask_loss_for_padding and "action_is_pad" in batch:
             mask = ~batch["action_is_pad"].unsqueeze(-1)
-            num_valid = mask.sum() * loss.shape[-1]
-            return (loss * mask).sum() / num_valid.clamp_min(1)
+            weighted = loss * mask
+            denom = (mask * self.action_loss_weights.to(device=loss.device, dtype=loss.dtype)).sum()
+            return weighted.sum() / denom.clamp_min(1e-8)
 
         return loss.mean()
 

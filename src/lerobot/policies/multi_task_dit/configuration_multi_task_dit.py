@@ -101,6 +101,11 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     scheduler_warmup_steps: int = 0
     do_mask_loss_for_padding: bool = False
 
+    # Per-action-dimension weights for diffusion / flow-matching MSE (length must match action dim).
+    # Example for 6-D SO100-style actions (gripper last): (1.0, 1.0, 1.0, 1.0, 1.0, 4.0)
+    # Default None means uniform weighting (all 1.0).
+    action_loss_weights: tuple[float, ...] | None = None
+
     # Auto-calculated
     drop_n_last_frames: int | None = None
 
